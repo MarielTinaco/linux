@@ -279,6 +279,7 @@ config AD7303
 config AD8460
 	tristate "Analog Devices AD8460 DAC driver"
 	depends on SPI
+	select REGMAP_SPI
 	select IIO_BUFFER
 	select IIO_BUFFER_DMAENGINE
 	help

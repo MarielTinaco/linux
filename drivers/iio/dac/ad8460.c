@@ -86,7 +86,7 @@ struct ad8460_state {
 	 * DMA (thus cache coherency maintenance) requires the
 	 * transfer buffers to live in their own cache lines.
 	 */
-	__le16 spi_tx_buf[2] __aligned(IIO_DMA_MINALIGN);
+	__le16 spi_tx_buf __aligned(IIO_DMA_MINALIGN);
 };
 
 static int ad8460_hv_reset(struct ad8460_state *state)
@@ -160,14 +160,14 @@ static int ad8460_get_hvdac_word(struct ad8460_state *state, int index, int *val
 	if (ret)
 		return ret;
 
-	*val = le16_to_cpu(state->spi_tx_buf[0]);
+	*val = le16_to_cpu(state->spi_tx_buf);
 
 	return ret;
 }
 
 static int ad8460_set_hvdac_word(struct ad8460_state *state, int index, int val)
 {
-	state->spi_tx_buf[0] = cpu_to_le16(FIELD_PREP(AD8460_DATA_BYTE_FULL_MSK, val));
+	state->spi_tx_buf = cpu_to_le16(FIELD_PREP(AD8460_DATA_BYTE_FULL_MSK, val));
 
 	return regmap_bulk_write(state->regmap, AD8460_HVDAC_DATA_WORD(index),
 				 &state->spi_tx_buf, AD8460_DATA_BYTE_WORD_LENGTH);
@@ -264,14 +264,9 @@ static ssize_t ad8460_write_toggle_en(struct iio_dev *indio_dev, uintptr_t priva
 	if (ret)
 		return ret;
 
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
-
-	ret = ad8460_enable_apg_mode(state, toggle_en);
-
-	iio_device_release_direct_mode(indio_dev);
-	return ret;
+	iio_device_claim_direct_scoped(return -EBUSY, indio_dev)
+		return ad8460_enable_apg_mode(state, toggle_en);
+	unreachable();
 }
 
 static ssize_t ad8460_read_powerdown(struct iio_dev *indio_dev, uintptr_t private,
@@ -426,20 +421,14 @@ static int ad8460_write_raw(struct iio_dev *indio_dev,
 			    long mask)
 {
 	struct ad8460_state *state = iio_priv(indio_dev);
-	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
 		switch (chan->type) {
 		case IIO_VOLTAGE:
-			ret = iio_device_claim_direct_mode(indio_dev);
-			if (ret)
-				return ret;
-
-			ret = ad8460_set_sample(state, val);
-
-			iio_device_release_direct_mode(indio_dev);
-			return ret;
+			iio_device_claim_direct_scoped(return -EBUSY, indio_dev)
+				return ad8460_set_sample(state, val);
+			unreachable();
 		case IIO_CURRENT:
 			return regmap_write(state->regmap, AD8460_CTRL_REG(0x04),
 					    FIELD_PREP(AD8460_QUIESCENT_CURRENT_MSK, val));
@@ -799,17 +788,11 @@ static const char * const ad8460_supplies[] = {
 	"avdd_3p3v", "dvdd_3p3v", "vcc_5v", "hvcc", "hvee", "vref_5v"
 };
 
-static void ad8460_regulator_disable(void *data)
-{
-	regulator_disable(data);
-}
-
 static int ad8460_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
 	struct ad8460_state *state;
 	struct iio_dev *indio_dev;
-	struct regulator *vrefio;
 	u32 tmp[2], temp;
 	int ret;
 
@@ -864,38 +847,18 @@ static int ad8460_probe(struct spi_device *spi)
 		return ret;
 	}
 
-	vrefio = devm_regulator_get_optional(&spi->dev, "refio_1p2v");
-	if (IS_ERR(vrefio)) {
-		if (PTR_ERR(vrefio) != -ENODEV)
-			return dev_err_probe(&spi->dev, PTR_ERR(vrefio),
-					"Failed to get vref regulator\n");
+	ret = devm_regulator_get_enable_read_voltage(dev, "refio_1p2v");
+	if (ret < 0 && ret != -ENODEV)
+		return dev_err_probe(dev, ret, "Failed to get reference voltage\n");
 
-		state->refio_1p2v_mv = 1200;
+	state->refio_1p2v_mv = ret == -ENODEV ? 1200 : ret / 1000;
 
-	} else {
-		ret = regulator_enable(vrefio);
-		if (ret)
-			return dev_err_probe(&spi->dev, ret,
-					"Failed to enable vrefio regulator\n");
-
-		ret = devm_add_action_or_reset(&spi->dev,
-					       ad8460_regulator_disable,
-					       vrefio);
-		if (ret)
-			return ret;
-
-		ret = regulator_get_voltage(vrefio);
-		if (ret < 0)
-			return dev_err_probe(&spi->dev, ret,
-					     "Failed to get vrefio\n");
-
-		if (ret < AD8460_MIN_VREFIO_UV / 1000 || ret > AD8460_MAX_VREFIO_UV / 1000)
-			return dev_err_probe(&spi->dev, -EINVAL,
-					     "Invalid ref voltage range(%u mV) [%u mV, %u mV]\n",
-					     state->refio_1p2v_mv,
-					     AD8460_MIN_VREFIO_UV / 1000,
-					     AD8460_MAX_VREFIO_UV / 1000);
-	}
+	if (ret < AD8460_MIN_VREFIO_UV / 1000 || ret > AD8460_MAX_VREFIO_UV / 1000)
+		return dev_err_probe(dev, -EINVAL,
+				     "Invalid ref voltage range(%u mV) [%u mV, %u mV]\n",
+				     state->refio_1p2v_mv,
+				     AD8460_MIN_VREFIO_UV / 1000,
+				     AD8460_MAX_VREFIO_UV / 1000);
 
 	ret = device_property_read_u32(dev, "adi,external-resistor-ohms",
 				       &state->ext_resistor_ohms);
